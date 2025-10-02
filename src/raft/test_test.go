@@ -8,7 +8,10 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
+import (
+	"log"
+	"testing"
+)
 import "fmt"
 import "time"
 import "math/rand"
@@ -19,6 +22,13 @@ import "sync"
 // (much more than the paper's range of timeouts).
 const RaftElectionTimeout = 1000 * time.Millisecond
 
+// TestInitialElection3A 测试初始选举功能
+// 测试目标：验证Raft集群启动后能否正确选出一个leader
+// 测试内容：
+// 1. 检查是否有且仅有一个leader被选出
+// 2. 验证所有节点的term一致且大于等于1
+// 3. 确认在没有网络故障时leader和term保持稳定
+// 4. 验证leader在稳定期间持续存在
 func TestInitialElection3A(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -50,7 +60,15 @@ func TestInitialElection3A(t *testing.T) {
 	cfg.end()
 }
 
-func TestReElection3A(t *testing.T) {
+// TestReElection3A 测试网络故障后的重新选举
+// 测试目标：验证网络分区和恢复时的leader选举机制
+// 测试内容：
+// 1. 断开当前leader，验证新leader能被选出
+// 2. 原leader重新连接后应转为follower
+// 3. 当没有多数派时，不应选出新leader
+// 4. 恢复多数派连接后应能选出leader
+// 5. 验证所有节点重新连接后leader依然存在
+func TestReElecti0on3A(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
@@ -90,6 +108,13 @@ func TestReElection3A(t *testing.T) {
 	cfg.end()
 }
 
+// TestManyElections3A 测试多次选举的稳定性
+// 测试目标：验证在频繁网络分区下选举机制的鲁棒性
+// 测试内容：
+// 1. 在7个服务器中随机断开3个节点
+// 2. 验证剩余4个节点能维持或选出leader
+// 3. 重新连接所有节点
+// 4. 重复多次以测试选举的一致性和稳定性
 func TestManyElections3A(t *testing.T) {
 	servers := 7
 	cfg := make_config(t, servers, false, false)
@@ -123,6 +148,12 @@ func TestManyElections3A(t *testing.T) {
 	cfg.end()
 }
 
+// TestBasicAgree3B 测试基本的日志复制和一致性
+// 测试目标：验证leader能够成功复制日志条目到多数派节点
+// 测试内容：
+// 1. 提交多个命令到Raft集群
+// 2. 验证每个命令都能在正确的索引位置提交
+// 3. 确保所有节点对提交的日志条目达成一致
 func TestBasicAgree3B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -133,6 +164,7 @@ func TestBasicAgree3B(t *testing.T) {
 	iters := 3
 	for index := 1; index < iters+1; index++ {
 		nd, _ := cfg.nCommitted(index)
+		log.Printf("TestBasicAgree3B nd: %d", nd)
 		if nd > 0 {
 			t.Fatalf("some have committed before Start()")
 		}
@@ -146,8 +178,12 @@ func TestBasicAgree3B(t *testing.T) {
 	cfg.end()
 }
 
-// check, based on counting bytes of RPCs, that
-// each command is sent to each peer just once.
+// TestRPCBytes3B 测试RPC字节数的效率
+// 测试目标：验证每个命令只发送给每个peer一次，避免重复发送
+// 测试内容：
+// 1. 统计发送大量命令前后的RPC字节数
+// 2. 验证实际发送的字节数不超过预期值太多
+// 3. 确保RPC通信的效率符合要求
 func TestRPCBytes3B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -179,7 +215,12 @@ func TestRPCBytes3B(t *testing.T) {
 	cfg.end()
 }
 
-// test just failure of followers.
+// TestFollowerFailure3B 测试follower故障的处理
+// 测试目标：验证follower节点故障时系统的容错能力
+// 测试内容：
+// 1. 逐步断开follower节点
+// 2. 验证leader和剩余follower能继续达成一致
+// 3. 当失去多数派时，确保命令无法提交
 func TestFollowerFailure3B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -187,7 +228,12 @@ func TestFollowerFailure3B(t *testing.T) {
 
 	cfg.begin("Test (3B): test progressive failure of followers")
 
-	cfg.one(101, servers, false)
+	index1 := cfg.one(101, servers, false)
+
+	nn, _ := cfg.nCommitted(index1)
+	if nn != servers {
+		t.Fatalf("%v committed but no majority", nn)
+	}
 
 	// disconnect one follower from the network.
 	leader1 := cfg.checkOneLeader()
@@ -224,7 +270,13 @@ func TestFollowerFailure3B(t *testing.T) {
 	cfg.end()
 }
 
-// test just failure of leaders.
+// TestLeaderFailure3B 测试leader故障的处理
+// 测试目标：验证leader节点故障时的恢复机制
+// 测试内容：
+// 1. 断开当前leader连接
+// 2. 验证剩余节点能选出新leader并继续服务
+// 3. 再次断开新leader，测试连续故障的处理
+// 4. 确保失去多数派时命令无法提交
 func TestLeaderFailure3B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -264,8 +316,13 @@ func TestLeaderFailure3B(t *testing.T) {
 	cfg.end()
 }
 
-// test that a follower participates after
-// disconnect and re-connect.
+// TestFailAgree3B 测试follower重连后的一致性
+// 测试目标：验证断开的follower重新连接后能正确同步日志
+// 测试内容：
+// 1. 断开一个follower，leader继续处理命令
+// 2. 重新连接follower
+// 3. 验证follower能同步之前错过的日志条目
+// 4. 确保整个集群能继续正常工作
 func TestFailAgree3B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -300,6 +357,12 @@ func TestFailAgree3B(t *testing.T) {
 	cfg.end()
 }
 
+// TestFailNoAgree3B 测试多数派故障时无法达成一致
+// 测试目标：验证失去多数派时系统正确拒绝提交
+// 测试内容：
+// 1. 在5个节点中断开3个follower
+// 2. 验证leader无法提交新命令
+// 3. 恢复连接后验证系统能重新正常工作
 func TestFailNoAgree3B(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, false, false)
@@ -351,6 +414,12 @@ func TestFailNoAgree3B(t *testing.T) {
 	cfg.end()
 }
 
+// TestConcurrentStarts3B 测试并发Start()调用的处理
+// 测试目标：验证leader能正确处理并发的命令提交请求
+// 测试内容：
+// 1. 并发调用多个Start()方法
+// 2. 验证所有命令都能被正确处理和提交
+// 3. 确保并发操作不会导致数据不一致
 func TestConcurrentStarts3B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -452,6 +521,13 @@ loop:
 	cfg.end()
 }
 
+// TestRejoin3B 测试分区leader重新加入的处理
+// 测试目标：验证被分区的leader重新加入时的日志同步
+// 测试内容：
+// 1. 分区leader，让其尝试提交一些条目
+// 2. 新leader提交不同的条目
+// 3. 原leader重新加入时应正确处理日志冲突
+// 4. 验证最终所有节点日志一致
 func TestRejoin3B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -490,6 +566,13 @@ func TestRejoin3B(t *testing.T) {
 	cfg.end()
 }
 
+// TestBackup3B 测试leader快速回退错误的follower日志
+// 测试目标：验证leader能高效地修复follower的错误日志
+// 测试内容：
+// 1. 创建多个分区，让不同的leader提交大量条目
+// 2. 重新连接所有节点
+// 3. 验证新leader能快速回退并修复follower的日志
+// 4. 确保最终达成一致
 func TestBackup3B(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, false, false)
@@ -562,6 +645,12 @@ func TestBackup3B(t *testing.T) {
 	cfg.end()
 }
 
+// TestCount3B 测试RPC调用次数的合理性
+// 测试目标：验证RPC调用次数不会过多，确保效率
+// 测试内容：
+// 1. 统计选举和日志复制过程中的RPC次数
+// 2. 验证RPC次数在合理范围内
+// 3. 确保系统在空闲时不会产生过多RPC
 func TestCount3B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -672,6 +761,13 @@ loop:
 	cfg.end()
 }
 
+// TestPersist13C 测试基本的持久化功能
+// 测试目标：验证节点重启后能恢复持久化状态
+// 测试内容：
+// 1. 提交一些命令后重启所有节点
+// 2. 验证重启后节点能恢复之前的状态
+// 3. 测试单个节点重启的情况
+// 4. 确保持久化不影响正常的一致性协议
 func TestPersist13C(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -718,6 +814,12 @@ func TestPersist13C(t *testing.T) {
 	cfg.end()
 }
 
+// TestPersist23C 测试更复杂的持久化场景
+// 测试目标：验证在复杂网络分区和重启场景下的持久化
+// 测试内容：
+// 1. 多轮分区、重启、重连的组合操作
+// 2. 验证每次重启后节点都能正确恢复
+// 3. 确保持久化在各种故障场景下都能正常工作
 func TestPersist23C(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, false, false)
@@ -764,6 +866,12 @@ func TestPersist23C(t *testing.T) {
 	cfg.end()
 }
 
+// TestPersist33C 测试分区leader和follower崩溃后的恢复
+// 测试目标：验证leader和follower同时崩溃后的恢复机制
+// 测试内容：
+// 1. 分区后让leader和一个follower崩溃
+// 2. 重启leader，验证能与剩余节点协作
+// 3. 重启follower，验证最终一致性
 func TestPersist33C(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -794,14 +902,13 @@ func TestPersist33C(t *testing.T) {
 	cfg.end()
 }
 
-// Test the scenarios described in Figure 8 of the extended Raft paper. Each
-// iteration asks a leader, if there is one, to insert a command in the Raft
-// log.  If there is a leader, that leader will fail quickly with a high
-// probability (perhaps without committing the command), or crash after a while
-// with low probability (most likey committing the command).  If the number of
-// alive servers isn't enough to form a majority, perhaps start a new server.
-// The leader in a new term may try to finish replicating log entries that
-// haven't been committed yet.
+// TestFigure83C 测试Raft论文Figure 8描述的场景
+// 测试目标：验证复杂的leader故障和恢复场景
+// 测试内容：
+// 1. 随机让leader故障，可能在提交前或提交后
+// 2. 动态启动新服务器维持多数派
+// 3. 验证新leader能完成未提交条目的复制
+// 4. 测试1000次迭代确保鲁棒性
 func TestFigure83C(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, false, false)
@@ -858,6 +965,12 @@ func TestFigure83C(t *testing.T) {
 	cfg.end()
 }
 
+// TestUnreliableAgree3C 测试不可靠网络下的一致性
+// 测试目标：验证在网络不可靠时系统仍能达成一致
+// 测试内容：
+// 1. 启用网络不可靠模式（丢包、延迟、重复）
+// 2. 并发提交大量命令
+// 3. 验证最终所有命令都能正确提交
 func TestUnreliableAgree3C(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, true, false)
@@ -887,6 +1000,12 @@ func TestUnreliableAgree3C(t *testing.T) {
 	cfg.end()
 }
 
+// TestFigure8Unreliable3C 测试不可靠网络下的Figure 8场景
+// 测试目标：在网络不可靠的情况下测试复杂故障恢复
+// 测试内容：
+// 1. 结合网络不可靠和随机leader故障
+// 2. 启用长延迟重排序增加复杂性
+// 3. 验证系统在极端条件下的鲁棒性
 func TestFigure8Unreliable3C(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, true, false)
@@ -942,6 +1061,8 @@ func TestFigure8Unreliable3C(t *testing.T) {
 	cfg.end()
 }
 
+// internalChurn 内部函数，测试节点频繁加入和离开
+// 功能：模拟节点动态变化的环境，测试系统稳定性
 func internalChurn(t *testing.T, unreliable bool) {
 
 	servers := 5
@@ -1087,16 +1208,22 @@ func internalChurn(t *testing.T, unreliable bool) {
 	cfg.end()
 }
 
+// TestReliableChurn3C 测试可靠网络下的节点动态变化
+// 测试目标：验证节点频繁加入离开时系统的稳定性
 func TestReliableChurn3C(t *testing.T) {
 	internalChurn(t, false)
 }
 
+// TestUnreliableChurn3C 测试不可靠网络下的节点动态变化
+// 测试目标：在网络不可靠时测试节点动态变化的处理
 func TestUnreliableChurn3C(t *testing.T) {
 	internalChurn(t, true)
 }
 
 const MAXLOGSIZE = 2000
 
+// snapcommon 快照测试的通用函数
+// 功能：提供快照功能测试的通用逻辑和验证
 func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash bool) {
 	iters := 30
 	servers := 3
@@ -1161,30 +1288,51 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 	cfg.end()
 }
 
+// TestSnapshotBasic3D 测试基本的快照功能
+// 测试目标：验证基本的快照创建和应用机制
+// 测试内容：
+// 1. 提交足够多的日志条目触发快照
+// 2. 验证快照能正确保存状态
+// 3. 确保快照后系统继续正常工作
 func TestSnapshotBasic3D(t *testing.T) {
 	snapcommon(t, "Test (3D): snapshots basic", false, true, false)
 }
 
+// TestSnapshotInstall3D 测试快照安装功能
+// 测试目标：验证leader向follower发送快照的机制
+// 测试内容：
+// 1. 让follower落后很多日志条目
+// 2. leader发送快照给follower
+// 3. 验证follower能正确安装快照并同步
 func TestSnapshotInstall3D(t *testing.T) {
 	snapcommon(t, "Test (3D): install snapshots (disconnect)", true, true, false)
 }
 
+// TestSnapshotInstallUnreliable3D 测试不可靠网络下的快照安装
+// 测试目标：验证网络不可靠时快照安装的鲁棒性
 func TestSnapshotInstallUnreliable3D(t *testing.T) {
 	snapcommon(t, "Test (3D): install snapshots (disconnect+unreliable)",
 		true, false, false)
 }
 
+// TestSnapshotInstallCrash3D 测试快照安装过程中的崩溃恢复
+// 测试目标：验证快照安装过程中节点崩溃的处理
 func TestSnapshotInstallCrash3D(t *testing.T) {
 	snapcommon(t, "Test (3D): install snapshots (crash)", false, true, true)
 }
 
+// TestSnapshotInstallUnCrash3D 测试不可靠网络和崩溃的组合场景
+// 测试目标：验证最复杂情况下快照安装的正确性
 func TestSnapshotInstallUnCrash3D(t *testing.T) {
 	snapcommon(t, "Test (3D): install snapshots (unreliable+crash)", false, false, true)
 }
 
-// do the servers persist the snapshots, and
-// restart using snapshot along with the
-// tail of the log?
+// TestSnapshotAllCrash3D 测试所有节点崩溃后的快照恢复
+// 测试目标：验证集群重启后能从快照正确恢复
+// 测试内容：
+// 1. 创建快照后让所有节点崩溃
+// 2. 重启所有节点
+// 3. 验证能从快照恢复并继续工作
 func TestSnapshotAllCrash3D(t *testing.T) {
 	servers := 3
 	iters := 5
@@ -1223,8 +1371,8 @@ func TestSnapshotAllCrash3D(t *testing.T) {
 	cfg.end()
 }
 
-// do servers correctly initialize their in-memory copy of the snapshot, making
-// sure that future writes to persistent state don't lose state?
+// TestSnapshotInit3D 测试快照的初始化和基本操作
+// 测试目标：验证快照系统的初始化和基本功能
 func TestSnapshotInit3D(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, true)
