@@ -19,17 +19,30 @@ import (
 
 const linearizabilityCheckTimeout = 1 * time.Second
 
+// OpLog 操作日志结构体，用于记录和管理线性一致性检查所需的操作历史
+// 该结构体线程安全，可以在多个goroutine中并发使用
 type OpLog struct {
-	operations []porcupine.Operation
-	sync.Mutex
+	operations []porcupine.Operation // 存储所有操作的切片
+	sync.Mutex                       // 保护operations切片的互斥锁
 }
 
+// Append 向操作日志中添加一个新操作
+// 参数：
+//   - op: 要添加的操作，包含输入、输出、时间戳和客户端ID等信息
+// 
+// 该方法是线程安全的，可以在并发环境中安全调用
 func (log *OpLog) Append(op porcupine.Operation) {
 	log.Lock()
 	defer log.Unlock()
 	log.operations = append(log.operations, op)
 }
 
+// Read 读取操作日志中的所有操作
+// 返回值：
+//   - []porcupine.Operation: 所有操作的副本切片
+//
+// 该方法返回操作的深拷贝，避免外部修改影响内部状态
+// 主要用于线性一致性检查时获取完整的操作历史
 func (log *OpLog) Read() []porcupine.Operation {
 	log.Lock()
 	defer log.Unlock()

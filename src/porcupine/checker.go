@@ -6,24 +6,27 @@ import (
 	"time"
 )
 
+// entryKind 表示条目类型：调用或返回
 type entryKind bool
 
 const (
-	callEntry   entryKind = false
-	returnEntry           = true
+	callEntry   entryKind = false // 调用条目
+	returnEntry           = true  // 返回条目
 )
 
+// entry 表示操作历史中的一个条目（调用或返回）
 type entry struct {
-	kind     entryKind
-	value    interface{}
-	id       int
-	time     int64
-	clientId int
+	kind     entryKind   // 条目类型（调用或返回）
+	value    interface{} // 操作的输入或输出值
+	id       int         // 操作的唯一标识符
+	time     int64       // 操作发生的时间戳
+	clientId int         // 执行操作的客户端ID
 }
 
+// linearizationInfo 包含线性化检查的详细信息，用于调试和可视化
 type linearizationInfo struct {
-	history               [][]entry // for each partition, a list of entries
-	partialLinearizations [][][]int // for each partition, a set of histories (list of ids)
+	history               [][]entry // 每个分区的条目列表
+	partialLinearizations [][][]int // 每个分区的部分线性化序列集合
 }
 
 type byTime []entry
@@ -176,52 +179,83 @@ func unlift(entry *node) {
 	entry.next.prev = entry
 }
 
+// checkSingle 对单个分区的操作历史进行线性一致性检查
+// 这是Porcupine算法的核心实现，使用深度优先搜索来寻找有效的线性化序列
+// 参数：
+//   - model: 系统模型，定义状态转换规则
+//   - history: 单个分区的操作历史条目列表
+//   - computePartial: 是否计算部分线性化信息（用于调试）
+//   - kill: 用于提前终止检查的原子标志
+// 返回值：
+//   - bool: 该分区是否满足线性一致性
+//   - []*[]int: 包含每个操作的最长线性化前缀（用于调试）
+//
+// 算法原理：
+// 1. 将操作历史转换为链表结构，每个调用操作与其对应的返回操作配对
+// 2. 使用深度优先搜索遍历所有可能的操作执行顺序
+// 3. 对于每个可能的操作，检查其是否能在当前状态下合法执行
+// 4. 使用缓存避免重复计算相同的状态组合
+// 5. 通过回溯机制探索所有可能的线性化序列
 func checkSingle(model Model, history []entry, computePartial bool, kill *int32) (bool, []*[]int) {
-	entry := makeLinkedEntries(history)
-	n := length(entry) / 2
-	linearized := newBitset(uint(n))
-	cache := make(map[uint64][]cacheEntry) // map from hash to cache entry
-	var calls []callsEntry
-	// longest linearizable prefix that includes the given entry
-	longest := make([]*[]int, n)
+	entry := makeLinkedEntries(history)                    // 将条目转换为链表结构
+	n := length(entry) / 2                                 // 操作数量（每个操作有调用和返回两个条目）
+	linearized := newBitset(uint(n))                       // 记录已线性化的操作
+	cache := make(map[uint64][]cacheEntry)                 // 缓存：从状态哈希到缓存条目的映射
+	var calls []callsEntry                                 // 当前线性化序列中的调用栈
+	longest := make([]*[]int, n)                           // 每个操作的最长线性化前缀
 
-	state := model.Init()
-	headEntry := insertBefore(&node{value: nil, match: nil, id: -1}, entry)
+	state := model.Init()                                  // 初始化系统状态
+	headEntry := insertBefore(&node{value: nil, match: nil, id: -1}, entry) // 创建头节点
+	
+	// 深度优先搜索遍历所有可能的操作执行顺序
 	for headEntry.next != nil {
+		// 检查是否需要提前终止
 		if atomic.LoadInt32(kill) != 0 {
 			return false, longest
 		}
+		
+		// 当前条目是调用操作且有匹配的返回操作
 		if entry.match != nil {
-			matching := entry.match // the return entry
+			matching := entry.match // 对应的返回条目
+			// 检查该操作是否能在当前状态下合法执行
 			ok, newState := model.Step(state, entry.value, matching.value)
 			if ok {
+				// 操作合法，尝试将其加入线性化序列
 				newLinearized := linearized.clone().set(uint(entry.id))
 				newCacheEntry := cacheEntry{newLinearized, newState}
+				
+				// 检查缓存中是否已存在相同的状态组合
 				if !cacheContains(model, cache, newCacheEntry) {
+					// 新状态，加入缓存并继续搜索
 					hash := newLinearized.hash()
 					cache[hash] = append(cache[hash], newCacheEntry)
 					calls = append(calls, callsEntry{entry, state})
 					state = newState
 					linearized.set(uint(entry.id))
-					lift(entry)
-					entry = headEntry.next
+					lift(entry)                    // 将操作从链表中移除
+					entry = headEntry.next         // 继续处理下一个操作
 				} else {
+					// 状态已存在于缓存中，跳过该操作
 					entry = entry.next
 				}
 			} else {
+				// 操作不合法，跳过该操作
 				entry = entry.next
 			}
 		} else {
+			// 当前条目是返回操作或无匹配的调用操作，需要回溯
 			if len(calls) == 0 {
+				// 无法回溯，线性化失败
 				return false, longest
 			}
-			// longest
+			
+			// 计算部分线性化信息（用于调试）
 			if computePartial {
 				callsLen := len(calls)
 				var seq []int = nil
 				for _, v := range calls {
 					if longest[v.entry.id] == nil || callsLen > len(*longest[v.entry.id]) {
-						// create seq lazily
+						// 延迟创建序列
 						if seq == nil {
 							seq = make([]int, len(calls))
 							for i, v := range calls {
@@ -232,16 +266,19 @@ func checkSingle(model Model, history []entry, computePartial bool, kill *int32)
 					}
 				}
 			}
+			
+			// 回溯到上一个状态
 			callsTop := calls[len(calls)-1]
 			entry = callsTop.entry
 			state = callsTop.state
 			linearized.clear(uint(entry.id))
 			calls = calls[:len(calls)-1]
-			unlift(entry)
-			entry = entry.next
+			unlift(entry)                      // 将操作重新加入链表
+			entry = entry.next                 // 尝试下一个可能的操作
 		}
 	}
-	// longest linearization is the complete linearization, which is calls
+	
+	// 找到完整的线性化序列
 	seq := make([]int, len(calls))
 	for i, v := range calls {
 		seq[i] = v.entry.id
@@ -271,12 +308,25 @@ func fillDefault(model Model) Model {
 	return model
 }
 
+// checkParallel 并行检查多个分区的线性一致性
+// 参数：
+//   - model: 系统模型
+//   - history: 按分区组织的操作历史，每个分区独立检查
+//   - computeInfo: 是否计算详细的线性化信息用于调试
+//   - timeout: 检查超时时间，0表示无超时限制
+// 返回值：
+//   - CheckResult: 检查结果（Ok、Illegal或Unknown）
+//   - linearizationInfo: 详细的线性化信息（仅在computeInfo为true时有效）
+//
+// 该函数为每个分区启动一个goroutine进行并行检查，提高检查效率
 func checkParallel(model Model, history [][]entry, computeInfo bool, timeout time.Duration) (CheckResult, linearizationInfo) {
 	ok := true
 	timedOut := false
-	results := make(chan bool, len(history))
-	longest := make([][]*[]int, len(history))
-	kill := int32(0)
+	results := make(chan bool, len(history))        // 收集各分区检查结果的通道
+	longest := make([][]*[]int, len(history))       // 存储各分区的最长线性化前缀
+	kill := int32(0)                                // 用于提前终止所有goroutine的标志
+	
+	// 为每个分区启动独立的检查goroutine
 	for i, subhistory := range history {
 		go func(i int, subhistory []entry) {
 			ok, l := checkSingle(model, subhistory, computeInfo, &kill)
@@ -284,10 +334,13 @@ func checkParallel(model Model, history [][]entry, computeInfo bool, timeout tim
 			results <- ok
 		}(i, subhistory)
 	}
+	
+	// 设置超时机制
 	var timeoutChan <-chan time.Time
 	if timeout > 0 {
 		timeoutChan = time.After(timeout)
 	}
+	
 	count := 0
 loop:
 	for {
@@ -295,32 +348,36 @@ loop:
 		case result := <-results:
 			count++
 			ok = ok && result
+			// 如果发现非线性化且不需要详细信息，立即终止其他goroutine
 			if !ok && !computeInfo {
 				atomic.StoreInt32(&kill, 1)
 				break loop
 			}
+			// 所有分区检查完成
 			if count >= len(history) {
 				break loop
 			}
 		case <-timeoutChan:
+			// 检查超时，可能产生假阳性结果
 			timedOut = true
 			atomic.StoreInt32(&kill, 1)
-			break loop // if we time out, we might get a false positive
+			break loop
 		}
 	}
+	
 	var info linearizationInfo
 	if computeInfo {
-		// make sure we've waited for all goroutines to finish,
-		// otherwise we might race on access to longest[]
+		// 确保所有goroutine都已完成，避免竞态条件
 		for count < len(history) {
 			<-results
 			count++
 		}
-		// return longest linearizable prefixes that include each history element
+		
+		// 构建部分线性化信息用于调试
 		partialLinearizations := make([][][]int, len(history))
 		for i := 0; i < len(history); i++ {
 			var partials [][]int
-			// turn longest into a set of unique linearizations
+			// 将longest转换为唯一线性化序列的集合
 			set := make(map[*[]int]struct{})
 			for _, v := range longest[i] {
 				if v != nil {
@@ -339,35 +396,57 @@ loop:
 		info.history = history
 		info.partialLinearizations = partialLinearizations
 	}
+	
+	// 确定最终检查结果
 	var result CheckResult
 	if !ok {
-		result = Illegal
+		result = Illegal    // 发现非线性化行为
 	} else {
 		if timedOut {
-			result = Unknown
+			result = Unknown // 检查超时，结果未知
 		} else {
-			result = Ok
+			result = Ok      // 通过线性一致性检查
 		}
 	}
 	return result, info
 }
 
+// checkEvents 检查事件历史的线性一致性
+// 参数：
+//   - model: 系统模型
+//   - history: 事件历史记录
+//   - verbose: 是否返回详细信息
+//   - timeout: 检查超时时间
+// 返回值：
+//   - CheckResult: 检查结果
+//   - linearizationInfo: 详细信息（仅在verbose为true时有效）
 func checkEvents(model Model, history []Event, verbose bool, timeout time.Duration) (CheckResult, linearizationInfo) {
-	model = fillDefault(model)
-	partitions := model.PartitionEvent(history)
+	model = fillDefault(model)                          // 填充模型的默认方法
+	partitions := model.PartitionEvent(history)         // 按键分区事件历史
 	l := make([][]entry, len(partitions))
 	for i, subhistory := range partitions {
-		l[i] = convertEntries(renumber(subhistory))
+		l[i] = convertEntries(renumber(subhistory))     // 转换事件为条目格式
 	}
-	return checkParallel(model, l, verbose, timeout)
+	return checkParallel(model, l, verbose, timeout)    // 并行检查各分区
 }
 
+// checkOperations 检查操作历史的线性一致性（内部实现）
+// 参数：
+//   - model: 系统模型
+//   - history: 操作历史记录
+//   - verbose: 是否返回详细信息
+//   - timeout: 检查超时时间
+// 返回值：
+//   - CheckResult: 检查结果
+//   - linearizationInfo: 详细信息（仅在verbose为true时有效）
+//
+// 这是所有CheckOperations*函数的底层实现
 func checkOperations(model Model, history []Operation, verbose bool, timeout time.Duration) (CheckResult, linearizationInfo) {
-	model = fillDefault(model)
-	partitions := model.Partition(history)
+	model = fillDefault(model)                          // 填充模型的默认方法
+	partitions := model.Partition(history)              // 按键分区操作历史
 	l := make([][]entry, len(partitions))
 	for i, subhistory := range partitions {
-		l[i] = makeEntries(subhistory)
+		l[i] = makeEntries(subhistory)                  // 转换操作为条目格式
 	}
-	return checkParallel(model, l, verbose, timeout)
+	return checkParallel(model, l, verbose, timeout)    // 并行检查各分区
 }

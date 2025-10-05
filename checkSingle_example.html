@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>checkSingle 方法工作流程可视化</title>
+    <style>
+        body {
+            font-family: 'Arial', sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1, h2 {
+            color: #2c3e50;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 10px;
+        }
+        .step {
+            margin: 30px 0;
+            padding: 20px;
+            border: 2px solid #e74c3c;
+            border-radius: 8px;
+            background-color: #fdf2f2;
+        }
+        .step h3 {
+            color: #e74c3c;
+            margin-top: 0;
+        }
+        .data-flow {
+            display: flex;
+            align-items: center;
+            margin: 15px 0;
+            flex-wrap: wrap;
+        }
+        .data-box {
+            background: #3498db;
+            color: white;
+            padding: 10px 15px;
+            margin: 5px;
+            border-radius: 5px;
+            font-weight: bold;
+            min-width: 120px;
+            text-align: center;
+        }
+        .arrow {
+            font-size: 20px;
+            color: #e74c3c;
+            margin: 0 10px;
+        }
+        .state-box {
+            background: #27ae60;
+            color: white;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 8px;
+        }
+        .operation-box {
+            background: #f39c12;
+            color: white;
+            padding: 10px;
+            margin: 5px;
+            border-radius: 5px;
+            display: inline-block;
+        }
+        .linked-list {
+            display: flex;
+            align-items: center;
+            margin: 20px 0;
+            flex-wrap: wrap;
+        }
+        .node {
+            background: #9b59b6;
+            color: white;
+            padding: 10px;
+            margin: 5px;
+            border-radius: 5px;
+            position: relative;
+        }
+        .node::after {
+            content: "↔";
+            position: absolute;
+            right: -15px;
+            color: #2c3e50;
+            font-weight: bold;
+        }
+        .node:last-child::after {
+            content: "";
+        }
+        .cache-table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 15px 0;
+        }
+        .cache-table th, .cache-table td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        .cache-table th {
+            background-color: #34495e;
+            color: white;
+        }
+        .success {
+            background-color: #d4edda;
+            border-color: #c3e6cb;
+            color: #155724;
+        }
+        .failure {
+            background-color: #f8d7da;
+            border-color: #f5c6cb;
+            color: #721c24;
+        }
+        .timeline {
+            position: relative;
+            margin: 20px 0;
+        }
+        .timeline-item {
+            background: #ecf0f1;
+            padding: 15px;
+            margin: 10px 0;
+            border-left: 4px solid #3498db;
+            position: relative;
+        }
+        .timeline-item::before {
+            content: attr(data-time);
+            position: absolute;
+            left: -80px;
+            top: 15px;
+            background: #3498db;
+            color: white;
+            padding: 5px 10px;
+            border-radius: 3px;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔍 checkSingle 方法工作流程可视化</h1>
+        
+        <h2>📋 示例场景</h2>
+        <p><strong>键值存储操作历史：</strong></p>
+        <div class="timeline">
+            <div class="timeline-item" data-time="t=10">
+                <strong>客户端A调用:</strong> Put("x", "1")
+            </div>
+            <div class="timeline-item" data-time="t=20">
+                <strong>客户端B调用:</strong> Get("x")
+            </div>
+            <div class="timeline-item" data-time="t=30">
+                <strong>客户端A返回:</strong> Put("x", "1") → OK
+            </div>
+            <div class="timeline-item" data-time="t=40">
+                <strong>客户端B返回:</strong> Get("x") → "1"
+            </div>
+        </div>
+
+        <div class="step">
+            <h3>步骤1: 初始化数据结构</h3>
+            <div class="state-box">
+                <strong>初始状态:</strong><br>
+                • state = "" (空的KV存储)<br>
+                • linearized = {} (空的已线性化操作集合)<br>
+                • cache = {} (空的状态缓存)<br>
+                • calls = [] (空的调用栈)
+            </div>
+            
+            <p><strong>条目转换:</strong></p>
+            <div class="data-flow">
+                <div class="data-box">操作历史</div>
+                <div class="arrow">→</div>
+                <div class="data-box">条目列表</div>
+            </div>
+            
+            <div class="linked-list">
+                <div class="node">Call Put<br>t=10, id=0</div>
+                <div class="node">Call Get<br>t=20, id=1</div>
+                <div class="node">Ret Put<br>t=30, id=0</div>
+                <div class="node">Ret Get<br>t=40, id=1</div>
+            </div>
+        </div>
+
+        <div class="step">
+            <h3>步骤2: 第一次DFS迭代 - 处理Put操作</h3>
+            
+            <div class="data-flow">
+                <div class="data-box">当前条目<br>Call Put</div>
+                <div class="arrow">→</div>
+                <div class="data-box">检查匹配<br>有Ret Put</div>
+                <div class="arrow">→</div>
+                <div class="data-box">调用模型<br>Step()</div>
+            </div>
+
+            <div class="state-box">
+                <strong>模型调用:</strong><br>
+                model.Step(state="", input=Put("x","1"), output=OK)<br>
+                <strong>返回:</strong> ok=true, newState="x:1"
+            </div>
+
+            <div class="data-flow">
+                <div class="data-box success">操作合法!</div>
+                <div class="arrow">→</div>
+                <div class="data-box">更新状态</div>
+                <div class="arrow">→</div>
+                <div class="data-box">继续DFS</div>
+            </div>
+
+            <div class="state-box">
+                <strong>更新后状态:</strong><br>
+                • state = "x:1" (键x的值为1)<br>
+                • linearized = {0} (操作0已线性化)<br>
+                • calls = [{entry: Call Put, prevState: ""}] (保存回溯信息)<br>
+                • 链表: Put操作被移除(lift)
+            </div>
+
+            <div class="linked-list">
+                <div class="node" style="background: #95a5a6;">Call Put<br>(已移除)</div>
+                <div class="node">Call Get<br>t=20, id=1</div>
+                <div class="node" style="background: #95a5a6;">Ret Put<br>(已移除)</div>
+                <div class="node">Ret Get<br>t=40, id=1</div>
+            </div>
+        </div>
+
+        <div class="step">
+            <h3>步骤3: 第二次DFS迭代 - 处理Get操作</h3>
+            
+            <div class="data-flow">
+                <div class="data-box">当前条目<br>Call Get</div>
+                <div class="arrow">→</div>
+                <div class="data-box">检查匹配<br>有Ret Get</div>
+                <div class="arrow">→</div>
+                <div class="data-box">调用模型<br>Step()</div>
+            </div>
+
+            <div class="state-box">
+                <strong>模型调用:</strong><br>
+                model.Step(state="x:1", input=Get("x"), output="1")<br>
+                <strong>返回:</strong> ok=true, newState="x:1" (状态不变)
+            </div>
+
+            <div class="data-flow">
+                <div class="data-box success">操作合法!</div>
+                <div class="arrow">→</div>
+                <div class="data-box">更新状态</div>
+                <div class="arrow">→</div>
+                <div class="data-box">链表为空</div>
+            </div>
+
+            <div class="state-box">
+                <strong>最终状态:</strong><br>
+                • state = "x:1"<br>
+                • linearized = {0, 1} (所有操作都已线性化)<br>
+                • calls = [{entry: Call Put, prevState: ""}, {entry: Call Get, prevState: "x:1"}]<br>
+                • 链表: 空 (所有操作都已处理)
+            </div>
+
+            <div class="linked-list">
+                <div class="node" style="background: #95a5a6;">Call Put<br>(已移除)</div>
+                <div class="node" style="background: #95a5a6;">Call Get<br>(已移除)</div>
+                <div class="node" style="background: #95a5a6;">Ret Put<br>(已移除)</div>
+                <div class="node" style="background: #95a5a6;">Ret Get<br>(已移除)</div>
+            </div>
+        </div>
+
+        <div class="step success">
+            <h3>步骤4: 成功结束</h3>
+            <div class="state-box">
+                <strong>结果:</strong><br>
+                • 返回: (true, 线性化序列[0, 1])<br>
+                • 所有操作都找到了有效的线性化顺序<br>
+                • 系统满足线性一致性
+            </div>
+        </div>
+
+        <h2>🔄 数据流总结</h2>
+        <div class="data-flow">
+            <div class="data-box">操作历史</div>
+            <div class="arrow">→</div>
+            <div class="data-box">条目链表</div>
+            <div class="arrow">→</div>
+            <div class="data-box">DFS搜索</div>
+            <div class="arrow">→</div>
+            <div class="data-box">模型验证</div>
+            <div class="arrow">→</div>
+            <div class="data-box">线性化结果</div>
+        </div>
+
+        <h2>❌ 失败场景示例</h2>
+        <div class="step failure">
+            <h3>如果Get返回错误值"2"会怎样？</h3>
+            <div class="state-box" style="background: #e74c3c;">
+                <strong>模型调用:</strong><br>
+                model.Step(state="x:1", input=Get("x"), output="2")<br>
+                <strong>返回:</strong> ok=false (期望返回"1"，实际返回"2")
+            </div>
+            
+            <div class="data-flow">
+                <div class="data-box failure">操作不合法!</div>
+                <div class="arrow">→</div>
+                <div class="data-box">跳过操作</div>
+                <div class="arrow">→</div>
+                <div class="data-box">尝试其他路径</div>
+                <div class="arrow">→</div>
+                <div class="data-box">回溯或失败</div>
+            </div>
+        </div>
+
+        <h2>🧠 关键概念</h2>
+        <table class="cache-table">
+            <tr>
+                <th>概念</th>
+                <th>作用</th>
+                <th>示例</th>
+            </tr>
+            <tr>
+                <td><strong>状态转换</strong></td>
+                <td>验证操作的语义正确性</td>
+                <td>Put("x","1") 将状态从 "" 转换为 "x:1"</td>
+            </tr>
+            <tr>
+                <td><strong>深度优先搜索</strong></td>
+                <td>尝试所有可能的执行顺序</td>
+                <td>先尝试Put再Get，如果失败则尝试其他顺序</td>
+            </tr>
+            <tr>
+                <td><strong>回溯机制</strong></td>
+                <td>当路径失败时恢复之前状态</td>
+                <td>使用calls栈保存和恢复状态</td>
+            </tr>
+            <tr>
+                <td><strong>缓存优化</strong></td>
+                <td>避免重复计算相同状态</td>
+                <td>cache[state+linearized] = result</td>
+            </tr>
+        </table>
+
+        <div class="step">
+            <h3>🎯 算法核心思想</h3>
+            <p>checkSingle方法通过<strong>深度优先搜索</strong>尝试找到一个有效的操作执行顺序，使得：</p>
+            <ol>
+                <li><strong>语义正确性</strong>：每个操作的输入输出符合模型定义</li>
+                <li><strong>时间约束</strong>：操作的执行时间在其调用和返回时间之间</li>
+                <li><strong>完整性</strong>：所有操作都能被成功线性化</li>
+            </ol>
+            <p>如果找到这样的顺序，说明系统满足<strong>线性一致性</strong>；否则说明存在一致性违规。</p>
+        </div>
+    </div>
+</body>
+</html>

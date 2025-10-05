@@ -18,13 +18,15 @@ package raft
 //
 
 import (
-	"6.5840/labgob"
 	"bytes"
+	"fmt"
 	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"6.5840/labgob"
 
 	"6.5840/labrpc"
 )
@@ -281,6 +283,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	}
 	rf.log = append(rf.log, entry)
+	fmt.Println(fmt.Sprintf("start cmd: %v, log: %v", command, rf.log))
 	rf.persist()
 
 	// 更新本地复制进度
@@ -524,70 +527,109 @@ type AppendEntriesReply struct {
 	Success bool // 一致性检查是否通过（通过才会接受追加）
 }
 
-// AppendEntries 处理器：支持空心跳；实现基本一致性校验与commit推进
+// AppendEntries RPC处理器
+// 处理来自Leader的心跳和日志复制请求
+// 实现Raft论文Figure 2中的AppendEntries RPC接收者规则
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// 初始化回复
 	reply.Term = rf.currentTerm
 	reply.Success = false
 
-	// 如果 Leader 任期小于当前任期，拒绝
+	// 规则1：如果term < currentTerm，返回false（§5.1）
 	if args.Term < rf.currentTerm {
-		log.Printf("[Node %d] 拒绝来自 Node %d 的心跳：Leader任期 %d < 当前任期 %d", rf.me, args.LeaderId, args.Term, rf.currentTerm)
+		log.Printf("[Node %d] 拒绝来自 Node %d 的AppendEntries：Leader任期 %d < 当前任期 %d",
+			rf.me, args.LeaderId, args.Term, rf.currentTerm)
 		return
 	}
 
-	// 如果 Leader 任期更大或相等，转为 Follower
+	// 如果Leader任期更大或相等，转为Follower（§5.1）
 	if args.Term >= rf.currentTerm {
 		if args.Term > rf.currentTerm {
-			log.Printf("[Node %d] 收到来自 Node %d 的心跳，任期 %d > 当前任期 %d，转为Follower", rf.me, args.LeaderId, args.Term, rf.currentTerm)
+			log.Printf("[Node %d] 收到来自 Node %d 的AppendEntries，任期 %d > 当前任期 %d，转为Follower",
+				rf.me, args.LeaderId, args.Term, rf.currentTerm)
 		} else if rf.state != Follower {
-			log.Printf("[Node %d] 收到来自 Node %d 的心跳，任期 %d，转为Follower", rf.me, args.LeaderId, args.Term)
+			log.Printf("[Node %d] 收到来自 Node %d 的AppendEntries，任期 %d，转为Follower",
+				rf.me, args.LeaderId, args.Term)
 		}
 		rf.becomeFollowerLocked(args.Term)
 	}
 
-	// 重置选举超时
+	// 重置选举超时（收到有效Leader的消息）
 	rf.resetElectionTimerLocked()
 
-	// 日志一致性检查
+	// 规则2：如果日志在prevLogIndex处不包含与prevLogTerm匹配的条目，返回false（§5.3）
 	if args.PrevLogIndex > rf.lastLogIndex() {
-		log.Printf("[Node %d] 日志一致性检查失败：PrevLogIndex %d > lastLogIndex %d", rf.me, args.PrevLogIndex, rf.lastLogIndex())
+		log.Printf("[Node %d] 日志一致性检查失败：PrevLogIndex %d > lastLogIndex %d",
+			rf.me, args.PrevLogIndex, rf.lastLogIndex())
 		return
 	}
 
-	if args.PrevLogIndex >= 0 && args.PrevLogIndex < len(rf.log) {
-		if args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-			log.Printf("[Node %d] 日志一致性检查失败：PrevLogTerm不匹配 %d != %d", rf.me, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
+	// 检查prevLogIndex处的任期是否匹配
+	if args.PrevLogIndex > 0 {
+		if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			log.Printf("[Node %d] 日志一致性检查失败：PrevLogIndex=%d, 期望任期=%d, 实际任期=%d",
+				rf.me, args.PrevLogIndex, args.PrevLogTerm,
+				func() int {
+					if args.PrevLogIndex < len(rf.log) {
+						return rf.log[args.PrevLogIndex].Term
+					}
+					return -1
+				}())
 			return
 		}
 	}
 
-	// 心跳成功
+	// 到这里说明一致性检查通过
+	reply.Success = true
+
+	// 记录日志
 	if len(args.Entries) == 0 {
 		log.Printf("[Node %d] 接受来自Leader %d的心跳，任期 %d", rf.me, args.LeaderId, args.Term)
 	} else {
-		log.Printf("[Node %d] 接受来自Leader %d的日志追加，%d个条目", rf.me, args.LeaderId, len(args.Entries))
+		log.Printf("[Node %d] 接受来自Leader %d的日志追加，%d个条目，起始索引 %d",
+			rf.me, args.LeaderId, len(args.Entries), args.PrevLogIndex+1)
 	}
 
-	reply.Success = true
-
-	// 追加新日志条目（如果有）
+	// 规则3：如果现有条目与新条目冲突（相同索引但不同任期），删除现有条目及其后的所有条目（§5.3）
+	// 规则4：追加日志中不存在的任何新条目
 	if len(args.Entries) > 0 {
-		// 删除冲突的日志条目
-		rf.log = rf.log[:args.PrevLogIndex+1]
-		// 追加新条目
-		rf.log = append(rf.log, args.Entries...)
+		// 找到第一个冲突的位置
+		insertIndex := args.PrevLogIndex + 1
+		newEntriesIndex := 0
+
+		// 检查是否有冲突的条目
+		for insertIndex < len(rf.log) && newEntriesIndex < len(args.Entries) {
+			if rf.log[insertIndex].Term != args.Entries[newEntriesIndex].Term {
+				// 发现冲突，删除从这里开始的所有条目
+				log.Printf("[Node %d] 发现日志冲突，索引=%d，删除后续条目", rf.me, insertIndex)
+				rf.log = rf.log[:insertIndex]
+				break
+			}
+			insertIndex++
+			newEntriesIndex++
+		}
+
+		// 追加新条目（如果有）
+		if newEntriesIndex < len(args.Entries) {
+			rf.log = append(rf.log, args.Entries[newEntriesIndex:]...)
+			log.Printf("[Node %d] 追加 %d 个新日志条目，日志长度现在为 %d",
+				rf.me, len(args.Entries)-newEntriesIndex, len(rf.log))
+		}
+
+		// 持久化更新的日志
 		rf.persist()
 	}
 
-	// 更新提交索引
+	// 规则5：如果leaderCommit > commitIndex，设置commitIndex = min(leaderCommit, 新条目的索引)
 	if args.LeaderCommit > rf.commitIndex {
-		newCommitIndex := min(args.LeaderCommit, rf.lastLogIndex())
-		if newCommitIndex > rf.commitIndex {
-			log.Printf("[Node %d] 更新commitIndex从 %d 到 %d", rf.me, rf.commitIndex, newCommitIndex)
-			rf.commitIndex = newCommitIndex
+		oldCommitIndex := rf.commitIndex
+		rf.commitIndex = min(args.LeaderCommit, rf.lastLogIndex())
+		if rf.commitIndex > oldCommitIndex {
+			log.Printf("[Node %d] 更新commitIndex从 %d 到 %d", rf.me, oldCommitIndex, rf.commitIndex)
+			// 异步应用新提交的条目
 			go rf.applyCommittedEntries()
 		}
 	}
@@ -599,35 +641,51 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-// === 3C 辅助：对单个 follower 的复制循环（按 nextIndex 携带 entries）===
+// replicateToPeer 向单个follower复制日志条目
+// 这是Leader用来向特定follower同步日志的核心方法
+// 实现了Raft论文中的日志复制机制，包括冲突检测和回退
 func (rf *Raft) replicateToPeer(peer int, termStarted int) {
 	for !rf.killed() {
-		// 构造本轮要发送的 AE
 		rf.mu.Lock()
+
+		// 检查是否仍然是指定任期的Leader
 		if rf.state != Leader || rf.currentTerm != termStarted {
 			rf.mu.Unlock()
 			return
 		}
+
+		// 防止自己给自己发送
 		if peer == rf.me {
+			rf.mu.Unlock()
+			return
+		}
+
+		// 检查nextIndex和matchIndex是否已初始化
+		if rf.nextIndex == nil || rf.matchIndex == nil {
 			rf.mu.Unlock()
 			return
 		}
 
 		nextIdx := rf.nextIndex[peer]
 		lastIdx := rf.lastLogIndex()
-		// 若 follower 已追上，无需继续
+
+		// 如果follower已经追上最新日志，无需继续复制
 		if nextIdx > lastIdx {
 			rf.mu.Unlock()
 			return
 		}
 
+		// 构造AppendEntries参数
 		prevIndex := nextIdx - 1
 		prevTerm := 0
-		if prevIndex > 0 {
+		if prevIndex > 0 && prevIndex < len(rf.log) {
 			prevTerm = rf.log[prevIndex].Term
 		}
-		entries := make([]LogEntry, lastIdx-nextIdx+1)
-		copy(entries, rf.log[nextIdx:])
+
+		// 准备要发送的日志条目（限制批量大小以避免过大的RPC）
+		maxEntries := min(100, lastIdx-nextIdx+1) // 限制每次最多发送100个条目
+		entries := make([]LogEntry, maxEntries)
+		copy(entries, rf.log[nextIdx:nextIdx+maxEntries])
 
 		args := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
@@ -637,55 +695,75 @@ func (rf *Raft) replicateToPeer(peer int, termStarted int) {
 			Entries:      entries,
 			LeaderCommit: rf.commitIndex,
 		}
+
 		rf.mu.Unlock()
 
+		// 发送AppendEntries RPC
 		var reply AppendEntriesReply
 		ok := rf.sendAppendEntries(peer, args, &reply)
+
 		if !ok {
-			// 网络失败，稍后重试
-			time.Sleep(20 * time.Millisecond)
+			// 网络失败，短暂等待后重试
+			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 
 		rf.mu.Lock()
-		// 角色/任期变化则退出
-		if rf.state != Leader {
+
+		// 再次检查状态（RPC期间可能发生变化）
+		if rf.state != Leader || rf.currentTerm != termStarted {
 			rf.mu.Unlock()
 			return
 		}
+
+		// 如果收到更高任期，立即转为Follower
 		if reply.Term > rf.currentTerm {
+			log.Printf("[Node %d] 在复制到 Node %d 时发现更高任期 %d，转为Follower",
+				rf.me, peer, reply.Term)
 			rf.becomeFollowerLocked(reply.Term)
 			rf.mu.Unlock()
 			return
 		}
-		// 任期一致，处理结果
+
+		// 处理AppendEntries结果
 		if reply.Success {
-			// 已复制到 peer：推进 nextIndex/matchIndex
+			// 成功复制：更新nextIndex和matchIndex
 			newMatch := prevIndex + len(entries)
 			if newMatch > rf.matchIndex[peer] {
 				rf.matchIndex[peer] = newMatch
+				log.Printf("[Node %d] 成功复制到 Node %d，matchIndex 更新为 %d",
+					rf.me, peer, newMatch)
 			}
 			rf.nextIndex[peer] = rf.matchIndex[peer] + 1
 
-			// 尝试推进全局提交点（仅提交当前任期的日志）
+			// 尝试推进全局提交索引
 			oldCommit := rf.commitIndex
 			rf.tryAdvanceCommitLocked()
 			needApply := rf.commitIndex > oldCommit
+
 			rf.mu.Unlock()
 
+			// 如果有新的提交，异步应用
 			if needApply {
 				go rf.applyCommittedEntries()
 			}
-			// 已按批复制，若仍有剩余，由下一轮循环继续；若已追平，返回
+
+			// 继续下一轮复制（如果还有更多日志要复制）
 			continue
+
 		} else {
-			// 回退 nextIndex（简单线性回退；可在 3B/3C 做快速回退优化）
+			// 复制失败：实现快速回退优化
+			// 简单策略：每次回退1个位置，但不能低于1
 			if rf.nextIndex[peer] > 1 {
-				rf.nextIndex[peer] = max(1, rf.nextIndex[peer]-1)
+				rf.nextIndex[peer]--
+				log.Printf("[Node %d] 复制到 Node %d 失败，nextIndex 回退到 %d",
+					rf.me, peer, rf.nextIndex[peer])
 			}
+
 			rf.mu.Unlock()
-			// 立刻重试一轮
-			time.Sleep(10 * time.Millisecond)
+
+			// 短暂等待后重试
+			time.Sleep(20 * time.Millisecond)
 			continue
 		}
 	}
@@ -747,14 +825,18 @@ func max(a, b int) int {
 	return b
 }
 
-// 新增选举方法
+// startElection 开始选举过程
+// 作为候选者向所有其他节点请求投票，统计结果并决定是否成为Leader
+// 这是Raft选举机制的核心实现
 func (rf *Raft) startElection(term int) {
+	// 检查状态是否仍然有效
 	rf.mu.Lock()
 	if rf.currentTerm != term || rf.state != Candidate {
 		rf.mu.Unlock()
 		return
 	}
 
+	// 获取选举所需的日志信息
 	lastLogIndex := rf.lastLogIndex()
 	lastLogTerm := rf.lastLogTerm()
 	me := rf.me
@@ -763,11 +845,14 @@ func (rf *Raft) startElection(term int) {
 
 	log.Printf("[Node %d] 开始选举，任期 %d，向 %d 个节点请求投票", me, term, peersCount-1)
 
+	// 选举状态跟踪
 	votes := 1 // 自己的票
 	var mu sync.Mutex
 	cond := sync.NewCond(&mu)
 	finished := 0
+	electionDone := false
 
+	// 向所有其他节点并发发送投票请求
 	for i := range rf.peers {
 		if i == me {
 			continue
@@ -782,26 +867,37 @@ func (rf *Raft) startElection(term int) {
 			}
 			var reply RequestVoteReply
 
+			// 发送RequestVote RPC
 			if ok := rf.sendRequestVote(peer, args, &reply); ok {
 				mu.Lock()
+				defer mu.Unlock()
+
+				// 检查选举是否已经结束
+				if electionDone {
+					return
+				}
+
 				if reply.VoteGranted {
 					votes++
 					log.Printf("[Node %d] 收到 Node %d 的投票，当前票数：%d/%d", me, peer, votes, peersCount)
 				} else {
 					log.Printf("[Node %d] Node %d 拒绝投票，任期：%d", me, peer, reply.Term)
+					// 如果发现更大的任期，立即转为Follower
 					if reply.Term > term {
-						rf.mu.Lock()
-						if reply.Term > rf.currentTerm {
-							log.Printf("[Node %d] 发现更大任期 %d，转为Follower", me, reply.Term)
-							rf.becomeFollowerLocked(reply.Term)
-						}
-						rf.mu.Unlock()
+						go func() {
+							rf.mu.Lock()
+							if reply.Term > rf.currentTerm {
+								log.Printf("[Node %d] 发现更大任期 %d，转为Follower", me, reply.Term)
+								rf.becomeFollowerLocked(reply.Term)
+							}
+							rf.mu.Unlock()
+						}()
 					}
 				}
 				finished++
 				cond.Signal()
-				mu.Unlock()
 			} else {
+				// 网络错误，记录但继续等待其他回复
 				log.Printf("[Node %d] 向 Node %d 请求投票失败（网络错误）", me, peer)
 				mu.Lock()
 				finished++
@@ -811,14 +907,17 @@ func (rf *Raft) startElection(term int) {
 		}(i)
 	}
 
-	// 等待选举结果
+	// 等待选举结果：获得多数票或所有回复都收到
 	mu.Lock()
-	for votes <= peersCount/2 && finished < peersCount-1 {
+	for votes <= peersCount/2 && finished < peersCount-1 && !electionDone {
 		cond.Wait()
 	}
 
+	electionDone = true
+
 	if votes > peersCount/2 {
 		log.Printf("[Node %d] 选举成功！获得 %d/%d 票，成为Leader", me, votes, peersCount)
+		// 检查状态仍然有效，然后成为Leader
 		rf.mu.Lock()
 		if rf.currentTerm == term && rf.state == Candidate {
 			rf.becomeLeaderLocked()
